@@ -1,3 +1,3 @@
-# Smalle-area-population-estimates-from-sparsely-distributed-health-intervention-campaign-data-
+# Small-area-population-estimates-from-sparsely-distributed-health-intervention-campaign-data-
 We develop Bayesian hieracrhical population modelling approach based on INLA-SPDE which produced estimates of population counts ion Nigeria at very fine area scales using datasets from health intervention campaign. 
 However, data was only available across 9 states out of the 37 states (plus the capital). This led to a very highly sparsely distributed datasets across the country. With our methodology, we were able to borrow strength from nearby locations to estimate population across area units without observations. We used Bayesian inference framework which allowed us to quantify uncertainties in these estimates. 

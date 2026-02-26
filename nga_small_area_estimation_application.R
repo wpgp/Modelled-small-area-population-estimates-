@@ -27,7 +27,6 @@ library(MASS)
 library(car)
 library(raster)
 
-
 # Set working directory for input and output files
 path <- "//worldpop.files.soton.ac.uk/Worldpop/Projects/WP517763_GRID3_Phase2/Working/NGA/CHRIS_N"
 data_path <- paste0(path, "/data/input/pop")#---paths for survey dat_sca:
@@ -2032,4 +2031,254 @@ tmap_arrange(stdrp_prd, stdrp_uncert,
              wd_drp_tot,wd_drp_uncert,
              nrow = 3, ncol= 2)
 
+
+
+  #--------------------------------------------------------------------
+#### Spatial Cross-validation
+#---------------------------------------------------------
+# install.packages("blockCV")
+library(blockCV)   # spatial folds
+library(terra)
+# install.packages("Metrics")
+library(Metrics)
+library(dplyr)
+#install.packages(
+# "INLA",
+#  repos = c(getOption("repos"),
+#           INLA="https://inla.r-inla-download.org/R/stable"),
+#  dep=TRUE
+#)
+#Roberts et al., 2017 — Cross-validation strategies for spatial data
+#doi:10.1111/ecog.02881
+
+clusters <- shp # shp is the shapefile which also contains key vars
+clusters$pop <- clusters$pop_drp
+clusters$bld <- clusters$bld_count
+clusters$resp <- clusters$pop/clusters$bld
+names(clusters)
+
+# Prepare covariate for INLA stack
+clusters$eps <- 1:nrow(clusters)
+covs_dens <- c("x28", "x30","x45","x48","x53", "x54") # besf fit covariates
+covars <- as.data.frame(clusters[, c(covs_dens, "eps")]) %>% dplyr::select(-geom)
+
+
+# Covariates scaling function
+stdize2 <- function(x)
+{
+  
+  stdz <- (x - mean(x[!is.na(x)]))/sd(x[!is.na(x)])
+  return(stdz)
+}
+dim(covars[,covs_dens]  <- apply(covars[,covs_dens], 2, stdize2)) #apply scaling
+
+
+# Create Spatial Cross-Validation Folds
+## Option A (recommended): Spatial blocking
+set.seed(42)
+
+folds <- blockCV::spatialBlock(
+  speciesData = clusters,
+  theRange = 50000,      # 50 km blocks (adjust)
+  k = 5,
+  selection = "random",
+  iteration = 100
+)
+
+clusters$fold_id <- folds$foldID
+
+#Build SPDE Mesh & Model Components
+#coords0 <- st_coordinates(clusters)
+coords0 <- coordinates(as(clusters, "Spatial"))
+coords <- cbind(coords0[,1],coords0[,2])
+non_convex_bdry <- inla.nonconvex.hull(coords, -0.035, -0.05, resolution = c(100, 100))
+mesh <- inla.mesh.2d(boundary = non_convex_bdry, max.edge=c(0.2,1),
+                     offset = c(0.2, 0.7),
+                     cutoff = 0.2)
+# visualise
+par(mfrow=c(1,1))
+plot(mesh)
+plot(shp, add=T)
+mesh$n # 1698 mesh nodes
+
+
+#mesh <- inla.mesh.2d(
+#  loc = cbind(coords[,1],coords[,2]),
+#  max.edge = c(0.5, 5),
+ # cutoff = 0.1
+#)
+#plot(mesh)
+
+spde <- inla.spde2.pcmatern(
+  mesh = mesh,
+  prior.range = c(50, 0.5),   # P(range < 50 km) = 0.5
+  prior.sigma = c(1, 0.01)
+)
+
+
+
+# Create Prediction Function
+# This function fits the model excluding one fold and predicts for that fold.
+
+run_fold <- function(test_fold){
+  #test_fold =1
+  train <- clusters %>% filter(fold_id != test_fold)
+  train_id <- which(clusters$fold_id!=test_fold)
+  
+  test  <- clusters %>% filter(fold_id == test_fold)
+  test_id <- which(clusters$fold_id==test_fold)
+ 
+  # Index for spatial field
+  field <- inla.spde.make.index(name="spatial.field",
+                                n.spde = spde$n.spde)
+  
+  # Projection matrices
+  coords_train <- coords[train_id,]
+  coords_test <- coords[test_id,]
+  
+  A_train <- inla.spde.make.A(mesh, loc=coords_train); dim(A_train)
+  A_test  <- inla.spde.make.A(mesh, loc=coords_test); dim(A_test)
+ 
+# train 
+  train$resp[train$resp==0] = NA
+  train$resp[is.nan(train$resp)] = NA
+  train$resp[is.infinite(train$resp)] = NA
+  
+  stack_train <- inla.stack(
+    data = list(y=train$resp),
+    A = list(A_train, 1),
+    effects=list(c(list(intercept=1), #the Intercept
+                   field),
+                 list(covars[train_id,])),
+    tag="train"
+  )
+
+# test  
+  stack_test <- inla.stack(
+    data = list(y=NA),
+    A = list(A_test, 1),
+    effects=list(c(list(intercept=1), #the Intercept
+                               field),
+                             list(covars[test_id,])),
+    tag="test"
+  )
+  
+  stack_full <- inla.stack(stack_train, stack_test)
+  
+  pcprior <- list(prec = list(prior = "pc.prec", param = c(1, 0.01)))  # PC prior
+  formula <- y ~ -1 + intercept + x28 + x30 + x45 + x48  + x53 + x54 +#
+    f(spatial.field, model=spde) + f(eps, model="iid", hyper = pcprior)
+
+  
+  result <- inla(
+    formula,
+    family="gamma",
+    data=inla.stack.data(stack_full),
+    control.predictor=list(A=inla.stack.A(stack_full),
+                           compute=TRUE),
+    control.compute = list(dic=T, waic=T, cpo=T, config=T)
+  )
+  
+  
+  index <- inla.stack.index(stack_full, "test")$data
+  pred_dens<- exp(result$summary.linear.predictor[index ,"mean"])# density
+  pred_pop<- pred_dens*test$bld #population
+
+  observed_dens <- test$resp
+  observed_pop <- test$pop
+  data.frame(
+    fold=test_fold,
+    obs_dens=observed_dens,
+    pred_dens=pred_dens,
+    obs_pop=observed_pop,
+    pred_pop=pred_pop
+  )
+}
+
+#Run Spatial Cross-Validation
+results <- do.call(rbind,
+                   lapply(unique(clusters$fold_id), run_fold))
+
+#RMSE
+rmse_dens <- rmse(results$obs_dens[!is.na(results$obs_dens)], 
+                  results$pred_dens[!is.na(results$obs_dens)])
+rmse_pop <- rmse(results$obs_pop[!is.na(results$obs_pop)], 
+                 round(results$pred_dens.1[!is.na(results$obs_pop)]))
+
+# mae
+mae_dens <- mae(results$obs_dens[!is.na(results$obs_dens)], 
+               results$pred_dens[!is.na(results$obs_dens)])
+mae_pop <- mae(results$obs_pop[!is.na(results$obs_pop)], 
+               round(results$pred_dens.1[!is.na(results$obs_pop)]))
+
+# Correlation
+cor_dens <- cor(results$obs_dens[!is.na(results$obs_dens)], 
+                results$pred_dens[!is.na(results$obs_dens)])
+cor_pop <- cor(results$obs_pop[!is.na(results$obs_pop)], 
+               results$pred_dens.1[!is.na(results$obs_pop)])
+
+# Coverage probability
+index <- inla.stack.index(stack_full, "test")$data
+
+pred_dens<- exp(result$summary.linear.predictor[index ,"mean"])# density
+pred_pop<- pred_dens*test$bld #population
+
+pred_densL <- exp(result$summary.linear.predictor[index ,"0.025quant"])# 
+pred_popL<- pred_densL*test$bld #population
+
+pred_densU <- exp(result$summary.linear.predictor[index ,"0.975quant"])
+pred_popU<- pred_densU*test$bld #population
+
+test$pred_dens = exp(result$summary.linear.predictor[index ,"mean"])
+
+dat_pred <- data.frame(obs_d = test$resp,
+                       pred_d = pred_dens,
+                       pred_dL = pred_densL,
+                       pred_dU = pred_densU,
+                       obs_p = test$pop,
+                       pred_p = pred_pop,
+                       pred_pL = pred_popL,
+                       pred_pU = pred_popU)
+
+dat_pred <- dat_pred %>% drop_na() # remove NAs 
+compute_coverage <- function(observed, lower, upper){
+  
+  covered <- observed >= lower & observed <= upper
+  coverage <- mean(covered)
+  return(coverage)
+}
+
+# density
+coverage_prob_dens <- compute_coverage(
+  dat_pred$obs_d,
+  dat_pred$pred_dL,
+  dat_pred$pred_dU
+)
+
+# pop
+coverage_prob_pop <-compute_coverage(
+  dat_pred$obs_p,
+  dat_pred$pred_pL,
+  dat_pred$pred_pU
+)
+
+# Plot caliberations
+par(mfrow=c(1,2))
+plot(results$obs_dens,
+     results$pred_dens,
+     pch=16)
+
+abline(0,1,col="red")
+
+
+plot(results$obs_pop[results$pred_dens.1<3e+05],
+     results$pred_dens.1[results$pred_dens.1<3e+05],
+     pch=16)
+
+abline(0,1,col="red")
+
+par(mfrow=c(1,1))
+
+
 save.image(paste0(results_path, "/nga_ward_level_model_07_02_2025.Rdata"))
+
